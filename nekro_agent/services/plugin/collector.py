@@ -4,7 +4,9 @@
 """
 
 import json
+import os
 import shutil
+import stat
 import sys
 from datetime import datetime
 from importlib import import_module, reload
@@ -12,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, List, Literal, Optional, Set, Tuple
 
 import git
+from fastapi import APIRouter
 from pydantic import BaseModel
 
 from nekro_agent.core.config import config
@@ -72,6 +75,15 @@ class PackageData(BaseModel):
 PACKAGE_DATA_PATH = Path(PACKAGES_DIR) / "package_data.json"
 
 
+def _remove_readonly(func, path, _):
+    """错误处理函数，用于删除只读文件"""
+    try:
+        Path(path).chmod(stat.S_IWRITE)
+        func(path)
+    except Exception as e:
+        logger.warning(f"无法删除文件 {path}: {e}")
+
+
 class PluginCollector:
     """插件收集器，用于管理所有已加载的插件"""
 
@@ -112,15 +124,24 @@ class PluginCollector:
 
         # 加载内置插件
         for item in self.builtin_plugin_dir.iterdir():
-            await self._try_load_plugin(item, is_builtin=True)
+            try:
+                await self._try_load_plugin(item, is_builtin=True)
+            except Exception as e:
+                logger.exception(f"加载内置插件失败: {item}: {e}")
 
-        # 加载工作目录插件
+        # 加载本地插件
         for item in self.workdir_plugin_dir.iterdir():
-            await self._try_load_plugin(item, is_builtin=False)
+            try:
+                await self._try_load_plugin(item, is_builtin=False)
+            except Exception as e:
+                logger.exception(f"加载本地插件失败: {item}: {e}")
 
-        # 加载packages插件
+        # 加载云端插件
         for item in self.packages_dir.iterdir():
-            await self._try_load_plugin(item, is_package=True)
+            try:
+                await self._try_load_plugin(item, is_package=True)
+            except Exception as e:
+                logger.exception(f"加载云端插件失败: {item}: {e}")
 
     async def unload_plugin_by_module_name(self, module_name: str, scope: Literal["all", "package", "local"] = "all") -> None:
         """卸载指定插件
@@ -230,6 +251,19 @@ class PluginCollector:
         # logger.debug(f"尝试加载插件: {real_path} 从 {fixed_module_name}")
         await self._try_load_plugin(real_path, is_builtin=is_builtin, is_package=is_package)
 
+        # 重载完成后，如果插件有路由，进行热重载
+        try:
+            reloaded_plugin = self.get_plugin_by_module_name(fixed_module_name)
+            if reloaded_plugin and reloaded_plugin.is_enabled:
+                from nekro_agent.services.plugin.router_manager import (
+                    plugin_router_manager,
+                )
+
+                if plugin_router_manager.reload_plugin_router(reloaded_plugin):
+                    logger.info(f"插件 {reloaded_plugin.name} 路由热重载成功")
+        except Exception as router_error:
+            logger.exception(f"插件路由热重载失败: {router_error}")
+
     async def clone_package(
         self,
         module_name: str,
@@ -290,21 +324,39 @@ class PluginCollector:
         if auto_reload:
             await self.reload_plugin_by_module_name(module_name, is_package=True)
 
-    async def remove_package(self, module_name: str) -> None:
+    async def remove_package(self, module_name: str, clear_config: bool = False) -> None:
         """删除云端插件
 
         Args:
             module_name: 云端插件模块名
+            clear_config: 是否删除插件配置文件和数据目录，默认为False
         """
         package_dir = self.packages_dir / module_name
         if not package_dir.exists():
             raise ValueError(f"云端插件 `{module_name}` 不存在")
 
+        # 获取插件实例以便删除配置文件
+        plugin = self.get_plugin_by_module_name(module_name)
+        
         # 先卸载插件，从插件收集器中移除，限制只卸载云端插件
         await self.unload_plugin_by_module_name(module_name, scope="package")
 
+        # 删除插件配置文件和数据目录
+        if clear_config and plugin:
+            plugin_data_dir = plugin._plugin_path  # noqa: SLF001
+            if plugin_data_dir.exists():
+                try:
+                    shutil.rmtree(plugin_data_dir, onerror=_remove_readonly)
+                    logger.info(f"已删除插件 {plugin.name} 的配置文件和数据目录: {plugin_data_dir}")
+                except Exception as e:
+                    logger.warning(f"删除插件 {plugin.name} 配置文件时发生错误: {e}")
+
         # 然后删除文件和包信息
-        shutil.rmtree(package_dir)
+        try:
+            shutil.rmtree(package_dir, onerror=_remove_readonly)
+        except Exception as e:
+            logger.error(f"删除云端插件目录失败: {package_dir}: {e}")
+            raise
         self.package_data.remove_package(module_name)
 
     async def _try_load_plugin(self, item_path: Path, is_builtin: bool = False, is_package: bool = False) -> bool:
@@ -528,11 +580,170 @@ class PluginCollector:
         logger.debug(f"获取到 {sum(len(methods) for methods in webhook_methods.values())} 个webhook方法")
         return webhook_methods
 
+    def load_plugins_api(self) -> APIRouter:
+        """加载所有插件的路由API
+
+        仿照适配器系统的设计，为所有启用的插件动态加载路由。
+        每个插件的路由将挂载在 /plugins/{plugin_key} 路径下。
+
+        Returns:
+            APIRouter: 包含所有插件路由的API路由器
+        """
+        api = APIRouter()
+        mounted_count = 0
+
+        logger.info(f"开始加载插件路由，当前已加载插件数量: {len(self.loaded_plugins)}")
+
+        for plugin_key, plugin in self.loaded_plugins.items():
+            try:
+                plugin_router = plugin.get_plugin_router()
+                if plugin_router:
+                    # 挂载插件路由，路径为 /plugins/{plugin_key}
+                    api.include_router(
+                        plugin_router,
+                        prefix=f"/plugins/{plugin_key}",
+                        tags=[f"Plugin:{plugin.name}"],
+                    )
+                    mounted_count += 1
+                    logger.info(f"✅ 插件 {plugin.name} 的路由已挂载到 /plugins/{plugin_key}")
+
+            except Exception as e:
+                logger.exception(f"❌ 加载插件 {plugin.name} 的路由失败: {e}")
+                continue
+
+        logger.info(f"插件路由加载完成，成功挂载 {mounted_count} 个插件的路由")
+        return api
+
+    def get_plugins_with_router(self) -> List[NekroPlugin]:
+        """获取所有具有自定义路由的插件
+
+        Returns:
+            List[NekroPlugin]: 具有自定义路由的插件列表
+        """
+        return [
+            plugin for plugin in self.loaded_plugins.values() if plugin.is_enabled and plugin.get_plugin_router() is not None
+        ]
+
+    def get_plugin_router_info(self) -> Dict[str, Dict[str, Any]]:
+        """获取所有插件的路由信息
+
+        Returns:
+            Dict[str, Dict[str, Any]]: 插件路由信息字典
+        """
+        router_info = {}
+
+        for plugin_key, plugin in self.loaded_plugins.items():
+            if not plugin.is_enabled:
+                continue
+
+            plugin_router = plugin.get_plugin_router()
+            if plugin_router:
+                routes_info = []
+                for route in plugin_router.routes:
+                    # 使用getattr安全地访问路由属性
+                    route_info = {
+                        "name": getattr(route, "name", ""),
+                        "path": getattr(route, "path", "unknown"),
+                        "methods": list(getattr(route, "methods", [])),
+                    }
+                    routes_info.append(route_info)
+
+                router_info[plugin_key] = {
+                    "plugin_name": plugin.name,
+                    "plugin_description": plugin.description,
+                    "mount_path": f"/plugins/{plugin_key}",
+                    "routes_count": len(routes_info),
+                    "routes": routes_info,
+                }
+
+        return router_info
+
     async def chat_channel_on_reset(self, ctx: AgentCtx) -> None:
         """聊天频道重置时执行"""
         for plugin in self.loaded_plugins.values():
             if plugin.is_enabled and plugin.on_reset_method:
                 await plugin.on_reset_method(ctx.model_copy())
+
+    async def cleanup_all_plugins(self) -> None:
+        """清理所有插件资源
+        
+        在应用关闭时调用所有插件的 cleanup_method
+        """
+        logger.info(f"开始清理所有插件资源，当前已加载插件数量: {len(self.loaded_plugins)}")
+        
+        cleanup_count = 0
+        for _plugin_key, plugin in self.loaded_plugins.items():
+            try:
+                if plugin.cleanup_method:
+                    await plugin.cleanup_method()
+                    cleanup_count += 1
+            except Exception as e:
+                logger.exception(f"清理插件 {plugin.name} 时发生错误: {e}")
+        
+        logger.info(f"所有插件清理完成，成功清理 {cleanup_count} 个插件")
+
+    async def clear_plugin_store_data(self, plugin_key: str) -> int:
+        """清除指定插件的所有存储数据
+
+        Args:
+            plugin_key: 插件键，格式为 "作者.插件名"
+
+        Returns:
+            int: 删除的数据条数
+
+        Raises:
+            ValueError: 当插件不存在时抛出
+        """
+        from nekro_agent.models.db_plugin_data import DBPluginData
+
+        plugin = self.get_plugin(plugin_key)
+        if not plugin:
+            raise ValueError(f"插件 `{plugin_key}` 不存在")
+
+        try:
+            # 删除该插件的所有存储数据
+            deleted_count = await DBPluginData.filter(plugin_key=plugin_key).delete()
+        except Exception as e:
+            logger.exception(f"清除插件 {plugin.name} 存储数据时发生错误: {e}")
+            raise
+        else:
+            logger.info(f"成功清除插件 {plugin.name} 的所有存储数据，共删除 {deleted_count} 条记录")
+            return deleted_count
+
+    async def clear_plugin_store_data_by_module_name(self, module_name: str) -> int:
+        """根据模块名清除指定插件的所有存储数据
+
+        Args:
+            module_name: 插件模块名
+
+        Returns:
+            int: 删除的数据条数
+
+        Raises:
+            ValueError: 当插件不存在时抛出
+        """
+        plugin = self.get_plugin_by_module_name(module_name)
+        if not plugin:
+            raise ValueError(f"插件模块 `{module_name}` 不存在")
+
+        return await self.clear_plugin_store_data(plugin.key)
+
+    async def clear_all_plugin_store_data(self) -> int:
+        """清除所有插件的存储数据
+
+        Returns:
+            int: 删除的数据条数
+        """
+        from nekro_agent.models.db_plugin_data import DBPluginData
+
+        try:
+            deleted_count = await DBPluginData.all().delete()
+        except Exception as e:
+            logger.exception(f"清除所有插件存储数据时发生错误: {e}")
+            raise
+        else:
+            logger.info(f"成功清除所有插件的存储数据，共删除 {deleted_count} 条记录")
+            return deleted_count
 
 
 # 全局插件收集器实例

@@ -13,6 +13,8 @@ import {
   Warning as WarningIcon,
   RadioButtonUnchecked as RadioButtonUncheckedIcon,
   Style as StyleIcon,
+  QuestionAnswer as QuestionAnswerIcon,
+  Chat as ChatIcon,
 } from '@mui/icons-material'
 import { ReactElement } from 'react'
 import { Theme } from '@mui/material'
@@ -200,6 +202,48 @@ export const ADAPTER_CONFIGS: Record<string, AdapterConfig> = {
     ],
   },
 
+  // Discord 适配器配置
+  discord: {
+    key: 'discord',
+    visual: {
+      displayName: 'Discord',
+      iconText: 'DC',
+      navIcon: <QuestionAnswerIcon />,
+      description: '连接到 Discord 平台的适配器，允许通过 Bot 与服务器和用户进行交互。',
+      tags: ['Discord', '聊天', '社区', 'IM'],
+    },
+    tabs: [
+      {
+        label: '主页',
+        value: 'home',
+        icon: <HomeIcon fontSize="small" />,
+        path: '',
+        component: <AdapterHomePage />,
+      },
+      {
+        label: '适配器配置',
+        value: 'config',
+        icon: <SettingsIcon fontSize="small" />,
+        path: 'config',
+        component: <AdapterConfigPage />,
+      },
+      {
+        label: '覆盖配置',
+        value: 'overrides',
+        icon: <StyleIcon fontSize="small" />,
+        path: 'overrides',
+        component: <AdapterOverrideConfigPage />,
+      },
+      {
+        label: '高级',
+        value: 'advanced',
+        icon: <EngineeringIcon fontSize="small" />,
+        path: 'advanced',
+        component: <AdapterAdvancedPage />,
+      },
+    ],
+  },
+
   // SSE 适配器配置
   sse: {
     key: 'sse',
@@ -209,6 +253,48 @@ export const ADAPTER_CONFIGS: Record<string, AdapterConfig> = {
       navIcon: <ApiIcon />,
       description: '基于 Server-Sent Events 的通用 HTTP 适配器',
       tags: ['SSE', 'HTTP', 'API'],
+    },
+    tabs: [
+      {
+        label: '主页',
+        value: 'home',
+        icon: <HomeIcon fontSize="small" />,
+        path: '',
+        component: <AdapterHomePage />,
+      },
+      {
+        label: '适配器配置',
+        value: 'config',
+        icon: <SettingsIcon fontSize="small" />,
+        path: 'config',
+        component: <AdapterConfigPage />,
+      },
+      {
+        label: '覆盖配置',
+        value: 'overrides',
+        icon: <StyleIcon fontSize="small" />,
+        path: 'overrides',
+        component: <AdapterOverrideConfigPage />,
+      },
+      {
+        label: '高级',
+        value: 'advanced',
+        icon: <EngineeringIcon fontSize="small" />,
+        path: 'advanced',
+        component: <AdapterAdvancedPage />,
+      },
+    ],
+  },
+
+  // WeChatPad 适配器配置
+  wechatpad: {
+    key: 'wechatpad',
+    visual: {
+      displayName: 'WeChatPad',
+      iconText: '微信',
+      navIcon: <ChatIcon />,
+      description: 'WeChatPad 微信适配器，支持微信消息收发和群聊管理',
+      tags: ['微信', 'WeChat', '聊天', 'IM'],
     },
     tabs: [
       {
